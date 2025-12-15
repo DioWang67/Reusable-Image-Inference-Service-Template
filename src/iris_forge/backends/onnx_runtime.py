@@ -3,7 +3,7 @@ from typing import Any, Dict, List
 import numpy as np
 import onnxruntime as ort
 
-from iris_forge.abstractions import InferenceEngine
+from ..abstractions import InferenceEngine
 
 
 class ONNXRuntimeEngine(InferenceEngine):

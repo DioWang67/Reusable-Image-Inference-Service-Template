@@ -4,7 +4,7 @@ import uuid
 import time
 from typing import Any, Callable, Awaitable, List, Optional
 
-from iris_forge.model_manager import ModelManager
+from .model_manager import ModelManager
 
 
 # --- Application Setup ---
@@ -138,7 +138,7 @@ import requests
 from fastapi import File, HTTPException, UploadFile
 from pydantic import BaseModel
 
-from iris_forge.processors import Preprocessor, decode_image, get_postprocessor
+from .processors import Preprocessor, decode_image, get_postprocessor
 
 
 # --- Pydantic Models for API ---
@@ -168,19 +168,21 @@ class InferenceResponse(BaseModel):
 
 # --- Helper Function for Inference ---
 
-async def run_inference_pipeline(
+from fastapi.concurrency import run_in_threadpool
+
+def _run_inference_pipeline_sync(
     model_name: str,
     model_version: str,
     image_bytes: bytes,
-    request: Request,
+    model_manager: ModelManager,
+    request_id: str,
 ) -> InferenceResponse:
     """
-    Orchestrates the full inference pipeline for a single image.
+    Synchronous implementation of the inference pipeline.
     """
     start_time = time.perf_counter()
 
     # 1. Get Model Engine
-    model_manager = request.app.state.model_manager
     model_manifest = model_manager.get_manifest(model_name, model_version)
     if not model_manifest:
         raise HTTPException(status_code=404, detail=f"Model '{model_name}' version '{model_version}' not found.")
@@ -210,7 +212,7 @@ async def run_inference_pipeline(
     return InferenceResponse(
         model_name=model_name,
         model_version=model_version,
-        request_id=request.state.request_id,
+        request_id=request_id,
         latency=LatencyReport(
             preprocessing_ms=(t_pre_end - t_pre_start) * 1000,
             inference_ms=(t_infer_end - t_infer_start) * 1000,
@@ -219,16 +221,39 @@ async def run_inference_pipeline(
         result=final_result,
     )
 
-async def run_batch_inference_pipeline(
+async def run_inference_pipeline(
+    model_name: str,
+    model_version: str,
+    image_bytes: bytes,
+    request: Request,
+) -> InferenceResponse:
+    """
+    Orchestrates the full inference pipeline for a single image.
+    Offloads the CPU-bound work to a threadpool.
+    """
+    model_manager = request.app.state.model_manager
+    # request.state.request_id is set by middleware, assuming it exists
+    request_id = getattr(request.state, "request_id", "unknown")
+    
+    return await run_in_threadpool(
+        _run_inference_pipeline_sync,
+        model_name,
+        model_version,
+        image_bytes,
+        model_manager,
+        request_id
+    )
+
+def _run_batch_inference_pipeline_sync(
     model_name: str,
     model_version: str,
     image_bytes_list: List[bytes],
-    request: Request,
+    model_manager: ModelManager,
+    base_request_id: str,
 ) -> List[InferenceResponse]:
     """
-    Orchestrates the full inference pipeline for a batch of images.
+    Synchronous implementation of the batch inference pipeline.
     """
-    model_manager = request.app.state.model_manager
     model_manifest = model_manager.get_manifest(model_name, model_version)
     if not model_manifest:
         raise HTTPException(status_code=404, detail=f"Model '{model_name}' version '{model_version}' not found.")
@@ -260,7 +285,7 @@ async def run_batch_inference_pipeline(
         response = InferenceResponse(
             model_name=model_name,
             model_version=model_version,
-            request_id=f"{request.state.request_id}-{i}",
+            request_id=f"{base_request_id}-{i}",
             latency=LatencyReport(
                 preprocessing_ms=(t_pre_end - t_pre_start) * 1000 / total_items,
                 inference_ms=(t_infer_end - t_infer_start) * 1000 / total_items,
@@ -271,6 +296,28 @@ async def run_batch_inference_pipeline(
         responses.append(response)
 
     return responses
+
+async def run_batch_inference_pipeline(
+    model_name: str,
+    model_version: str,
+    image_bytes_list: List[bytes],
+    request: Request,
+) -> List[InferenceResponse]:
+    """
+    Orchestrates the full inference pipeline for a batch of images.
+    Offloads CPU-bound work to a threadpool.
+    """
+    model_manager = request.app.state.model_manager
+    base_request_id = getattr(request.state, "request_id", "unknown")
+
+    return await run_in_threadpool(
+        _run_batch_inference_pipeline_sync,
+        model_name,
+        model_version,
+        image_bytes_list,
+        model_manager,
+        base_request_id
+    )
 
 
 # --- Inference Endpoints ---

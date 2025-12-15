@@ -3,7 +3,7 @@ from typing import Any, Dict, Optional
 
 import yaml
 
-from iris_forge.backends.onnx_runtime import ONNXRuntimeEngine
+from .backends.onnx_runtime import ONNXRuntimeEngine
 
 
 class ModelManager:
