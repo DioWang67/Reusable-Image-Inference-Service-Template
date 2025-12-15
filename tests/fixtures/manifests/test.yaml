@@ -1,0 +1,9 @@
+model_name: "test-classifier"
+version: "1.0"
+backend: "onnx"
+artifact_path: "test-classifier/1.0/model.onnx"
+input_preprocessing:
+  - type: "resize"
+    width: 224
+    height: 224
+output_type: "classification"

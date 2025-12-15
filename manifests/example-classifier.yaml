@@ -1,0 +1,12 @@
+model_name: "example-classifier"
+version: "1.0"
+backend: "onnx"
+artifact_path: "example-classifier/1.0/model.onnx"
+input_preprocessing:
+  - type: "resize"
+    width: 224
+    height: 224
+  - type: "normalize"
+    mean: [0.485, 0.456, 0.406]
+    std: [0.229, 0.224, 0.225]
+output_type: "classification"
