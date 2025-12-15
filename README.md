@@ -1,0 +1,1 @@
+# Reusable-Image-Inference-Service-Template
