@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+python-multipart
+requests
+pyyaml
+onnxruntime
+opencv-python-headless
+prometheus-fastapi-instrumentator
+python-json-logger
