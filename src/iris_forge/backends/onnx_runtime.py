@@ -24,7 +24,19 @@ class ONNXRuntimeEngine(InferenceEngine):
             model_spec: A dictionary containing model information. It should
                         have 'artifact_path' and optionally 'execution_providers'.
         """
-        providers = model_spec.get("execution_providers", ["CPUExecutionProvider"])
+        requested_providers = model_spec.get("execution_providers")
+        if requested_providers:
+            providers = requested_providers
+        else:
+            # Mirror the selection logic in onnx_infer: prefer CUDA when available, otherwise CPU.
+            available = ort.get_available_providers()
+            providers = []
+            if "CUDAExecutionProvider" in available:
+                providers.append("CUDAExecutionProvider")
+            if "CPUExecutionProvider" in available:
+                providers.append("CPUExecutionProvider")
+            if not providers:
+                raise RuntimeError("No ONNX Runtime execution providers available.")
 
         try:
             self.session = ort.InferenceSession(
@@ -50,8 +62,13 @@ class ONNXRuntimeEngine(InferenceEngine):
 
         # Create a dummy input based on the model's expected input shape
         input_shape = self.session.get_inputs()[0].shape
-        # Replace dynamic dimensions (like batch size) with a fixed value
-        dummy_shape = [1 if dim is None or isinstance(dim, str) else dim for dim in input_shape]
+        # Drop the batch dimension for a single-sample dummy input
+        sample_shape = input_shape[1:] if len(input_shape) > 1 else input_shape
+        # Replace dynamic dimensions (like batch size or symbolic dims) with a fixed value
+        dummy_shape = [
+            1 if dim is None or isinstance(dim, str) else dim
+            for dim in sample_shape
+        ]
         dummy_input = np.zeros(dummy_shape, dtype=np.float32)
 
         self.infer([dummy_input])
@@ -72,5 +89,5 @@ class ONNXRuntimeEngine(InferenceEngine):
 
         # For simplicity, this implementation assumes a single input model.
         # It can be extended for multi-input models.
-        input_feed = {self.input_names[0]: np.vstack(batch)}
+        input_feed = {self.input_names[0]: np.stack(batch)}
         return self.session.run(self.output_names, input_feed)

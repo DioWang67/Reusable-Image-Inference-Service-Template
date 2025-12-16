@@ -76,8 +76,9 @@ async def main():
         mock_infer.side_effect = lambda batch: time.sleep(0.5) or [0] # Return dummy result
         
         # Mock decode to return small dummy image
-        import numpy as np
-        mock_decode.return_value = np.zeros((10, 10, 3), dtype=np.uint8)
+        from PIL import Image
+        mock_decode.return_value = Image.new("RGB", (10, 10))
+
 
         # Start server in thread
         t = threading.Thread(target=run_server, daemon=True)

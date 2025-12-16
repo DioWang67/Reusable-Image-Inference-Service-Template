@@ -1,8 +1,11 @@
 import os
-from fastapi import FastAPI, Request
+import io
 import uuid
 import time
-from typing import Any, Callable, Awaitable, List, Optional
+from typing import Any, Callable, Awaitable, List, Optional, Union
+
+from fastapi import FastAPI, Request, Response
+
 
 from .model_manager import ModelManager
 
@@ -138,7 +141,7 @@ import requests
 from fastapi import File, HTTPException, UploadFile
 from pydantic import BaseModel
 
-from .processors import Preprocessor, decode_image, get_postprocessor
+from .processors import Preprocessor, decode_image, get_postprocessor, draw_bounding_boxes
 
 
 # --- Pydantic Models for API ---
@@ -176,7 +179,8 @@ def _run_inference_pipeline_sync(
     image_bytes: bytes,
     model_manager: ModelManager,
     request_id: str,
-) -> InferenceResponse:
+    visualize: bool = False,
+) -> Union[InferenceResponse, Response]:
     """
     Synchronous implementation of the inference pipeline.
     """
@@ -188,13 +192,15 @@ def _run_inference_pipeline_sync(
         raise HTTPException(status_code=404, detail=f"Model '{model_name}' version '{model_version}' not found.")
 
     engine = model_manager.get_model(model_name, model_version)
+    class_names = model_manifest.get("class_names")
 
     # 2. Preprocessing
     t_pre_start = time.perf_counter()
     image = decode_image(image_bytes)
     preprocessor = Preprocessor(model_manifest["input_preprocessing"])
-    processed_tensor = preprocessor(image)
+    processed_tensor, metadata = preprocessor(image)
     t_pre_end = time.perf_counter()
+    processed_h, processed_w = processed_tensor.shape[-2:]
 
     # 3. Inference
     t_infer_start = time.perf_counter()
@@ -204,11 +210,57 @@ def _run_inference_pipeline_sync(
 
     # 4. Post-processing
     t_post_start = time.perf_counter()
-    postprocessor = get_postprocessor(model_manifest["output_type"])
+    postprocess_kwargs = {}
+    if model_manifest["output_type"] == "detection":
+        postprocess_kwargs = {
+            "num_classes": model_manifest.get("num_classes"),
+            "conf_thres": model_manifest.get("conf_thres", 0.25),
+            "iou_thres": model_manifest.get("iou_thres", 0.45),
+            "apply_sigmoid": model_manifest.get("apply_sigmoid"),
+            "max_det": model_manifest.get("max_det", 300),
+            "img_size": (processed_w, processed_h),
+            "scale": metadata["scale"],
+            "pad": metadata["pad"],
+            "orig_size": metadata["orig_size"],
+        }
+    postprocessor = get_postprocessor(model_manifest["output_type"], **postprocess_kwargs)
     final_result = postprocessor(raw_result)
     t_post_end = time.perf_counter()
 
     # 5. Format Response
+
+    if visualize:
+        # currently only supports object detection drawing
+        if model_manifest["output_type"] == "detection":
+            # final_result already contains coordinates in original image space
+            # thanks to the metadata passed to postprocess_detection
+            
+            # Draw
+            vis_img = draw_bounding_boxes(image, final_result, class_names=class_names)
+            
+            logger.info(f"Visualizing {len(final_result)} detections")
+
+            
+            # Encode to JPEG
+            buf = io.BytesIO()
+            vis_img.save(buf, format="JPEG")
+            return Response(content=buf.getvalue(), media_type="image/jpeg")
+
+
+        else:
+            # Fallback or raise warning? For now verify simply returns JSON if not supported
+            return InferenceResponse(
+                model_name=model_name,
+                model_version=model_version,
+                request_id=request_id,
+                latency=LatencyReport(
+                    preprocessing_ms=(t_pre_end - t_pre_start) * 1000,
+                    inference_ms=(t_infer_end - t_infer_start) * 1000,
+                    postprocessing_ms=(t_post_end - t_post_start) * 1000,
+                ),
+                result=final_result,
+            )
+
     return InferenceResponse(
         model_name=model_name,
         model_version=model_version,
@@ -226,7 +278,8 @@ async def run_inference_pipeline(
     model_version: str,
     image_bytes: bytes,
     request: Request,
-) -> InferenceResponse:
+    visualize: bool = False,
+) -> Union[InferenceResponse, Response]:
     """
     Orchestrates the full inference pipeline for a single image.
     Offloads the CPU-bound work to a threadpool.
@@ -241,7 +294,8 @@ async def run_inference_pipeline(
         model_version,
         image_bytes,
         model_manager,
-        request_id
+        request_id,
+        visualize,
     )
 
 def _run_batch_inference_pipeline_sync(
@@ -260,11 +314,27 @@ def _run_batch_inference_pipeline_sync(
 
     engine = model_manager.get_model(model_name, model_version)
     preprocessor = Preprocessor(model_manifest["input_preprocessing"])
-    postprocessor = get_postprocessor(model_manifest["output_type"])
+    postprocess_kwargs = {}
+    if model_manifest["output_type"] == "detection":
+        postprocess_kwargs = {
+            "num_classes": model_manifest.get("num_classes"),
+            "conf_thres": model_manifest.get("conf_thres", 0.25),
+            "iou_thres": model_manifest.get("iou_thres", 0.45),
+            "apply_sigmoid": model_manifest.get("apply_sigmoid"),
+            "max_det": model_manifest.get("max_det", 300),
+        }
+    else:
+        postprocess_kwargs = {}
 
     # 1. Preprocessing
     t_pre_start = time.perf_counter()
-    batch_tensors = [preprocessor(decode_image(img_bytes)) for img_bytes in image_bytes_list]
+    batch_data = [preprocessor(decode_image(img_bytes)) for img_bytes in image_bytes_list]
+    batch_tensors = [tensor for tensor, _ in batch_data]
+    batch_metadata = [metadata for _, metadata in batch_data]
+    
+    if model_manifest["output_type"] == "detection" and batch_tensors:
+        h, w = batch_tensors[0].shape[-2:]
+        postprocess_kwargs["img_size"] = (w, h)
     t_pre_end = time.perf_counter()
 
     # 2. Inference
@@ -275,8 +345,25 @@ def _run_batch_inference_pipeline_sync(
     # 3. Post-processing
     t_post_start = time.perf_counter()
     # Assuming the output of the model is a list of results for each image in the batch
-    final_results = [postprocessor(res) for res in batch_raw_results]
+    postprocessor = get_postprocessor(model_manifest["output_type"], **postprocess_kwargs)
+    
+    # For detection, we need to pass metadata for each image
+    if model_manifest["output_type"] == "detection":
+        final_results = []
+        for res, meta in zip(batch_raw_results, batch_metadata):
+            # Create postprocessor with metadata for this specific image
+            kwargs = postprocess_kwargs.copy()
+            kwargs.update({
+                "scale": meta["scale"],
+                "pad": meta["pad"],
+                "orig_size": meta["orig_size"],
+            })
+            pp = get_postprocessor(model_manifest["output_type"], **kwargs)
+            final_results.append(pp([res]))
+    else:
+        final_results = [postprocessor(res) for res in batch_raw_results]
     t_post_end = time.perf_counter()
+
 
     # 4. Format Responses
     responses = []
@@ -322,7 +409,7 @@ async def run_batch_inference_pipeline(
 
 # --- Inference Endpoints ---
 
-@app.post("/v1/infer/{model_name}/{model_version}", response_model=InferenceResponse)
+@app.post("/v1/infer/{model_name}/{model_version}", response_model=Union[InferenceResponse, Any])
 async def infer(
     model_name: str,
     model_version: str,
@@ -330,6 +417,7 @@ async def infer(
     image_file: Optional[UploadFile] = File(None),
     image_url: Optional[str] = None,
     image_base64: Optional[str] = None,
+    visualize: bool = False,
 ):
     """
     Perform inference on a single image.
@@ -356,7 +444,7 @@ async def infer(
     else:
         raise HTTPException(status_code=400, detail="No image provided. Use 'image_file', 'image_url', or 'image_base64'.")
 
-    return await run_inference_pipeline(model_name, model_version, image_bytes, request)
+    return await run_inference_pipeline(model_name, model_version, image_bytes, request, visualize)
 
 @app.post("/v1/infer:batch/{model_name}/{model_version}", response_model=List[InferenceResponse])
 async def infer_batch(

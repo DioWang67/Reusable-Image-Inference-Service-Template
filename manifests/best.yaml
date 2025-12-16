@@ -1,0 +1,20 @@
+model_name: "best"
+version: "1.0"
+backend: "onnx"
+artifact_path: "best/1.0/best.onnx"
+# Optional: set CUDAExecutionProvider if GPU available, e.g.
+# execution_providers: ["CUDAExecutionProvider", "CPUExecutionProvider"]
+input_preprocessing:
+  - type: "letterbox"
+    width: 640
+    height: 640
+    color: [114, 114, 114]
+  - type: "normalize"
+    mean: [0.0, 0.0, 0.0]
+    std: [1.0, 1.0, 1.0]
+  - type: "channels_first"
+output_type: "detection"
+num_classes: 4
+conf_thres: 0.25
+iou_thres: 0.45
+max_det: 300
